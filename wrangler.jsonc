@@ -34,8 +34,8 @@
 		// How many distinct Google accounts may ever complete sign-in. Raise it
 		// for a shared deployment; Google caps unverified apps at 100 users.
 		"MAX_ACCOUNTS": "25",
-		// Only these Google accounts may connect. Comma-separate addresses
-		// when allowing more than one mailbox.
+		// Only verified Google accounts listed here may connect.
+		// Add additional addresses as a comma-separated list (no spaces required).
 		"ALLOWED_EMAILS": "sridharstudy417@gmail.com",
 		// Mail filter tools. Adds the gmail.settings.basic scope to sign-in;
 		// forwarding actions stay excluded whatever this says.
