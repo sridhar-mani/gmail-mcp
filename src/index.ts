@@ -1,9 +1,9 @@
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
-import type { StagedAttachment } from "./attachments";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { McpAgent } from "agents/mcp";
 import { z } from "zod";
+import type { StagedAttachment } from "./attachments";
 import {
 	type CalendarEvent,
 	calendarFetch,
@@ -172,9 +172,6 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 	override async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url);
 		this.origin = url.origin;
-		// A staged upload authenticates by its address alone: the boundary sends
-		// it here without a grant, and the secret in the path is what
-		// stage_attachment_begin handed the session that asked for it.
 		const account = request.headers.get(ACCOUNT_HEADER)?.toLowerCase();
 		if (account) {
 			const owner = await this.ctx.storage.get<string>("owner");
