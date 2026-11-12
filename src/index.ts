@@ -616,7 +616,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			if (!filename || filename === "download") filename = "attachment";
 			const contentType = response.headers.get("content-type")?.split(";")[0] ?? "application/octet-stream";
 			if (/[\\r\\n\\0]/.test(filename)) throw new Error("attachment filename contains a line break or NUL");
-			if (!/^[\\w.+-]+\\/[\\w.+-]+$/.test(contentType)) {
+			if (!/^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+$/.test(contentType)) {
 				throw new Error(`invalid attachment content type: ${contentType}`);
 			}
 			resolved.push({ filename, contentType, content });
