@@ -151,13 +151,16 @@ const filePartSchema = z.object({
 });
 type FilePartArg = z.infer<typeof filePartSchema>;
 
-// ChatGPT fileParams injects uploaded files as objects containing their signed URL and metadata.
-const chatGptFileSchema = z.object({
+// ChatGPT fileParams has appeared as both a signed URL string and a metadata object
+// across connector versions. Accept both wire representations; only trusted signed
+// URLs are downloaded by resolveChatGptFiles.
+const chatGptFileObjectSchema = z.object({
 	download_url: z.string().url(),
 	file_id: z.string(),
 	mime_type: z.string().optional(),
 	file_name: z.string().optional(),
 });
+const chatGptFileSchema = z.union([z.string().url(), chatGptFileObjectSchema]);
 type ChatGptFileRef = z.infer<typeof chatGptFileSchema>;
 
 
@@ -579,9 +582,10 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 		const resolved: FilePart[] = [];
 		let totalEncoded = 0;
 		for (const file of files ?? []) {
+			const downloadUrl = typeof file === "string" ? file : file.download_url;
 			let url: URL;
 			try {
-				url = new URL(file.download_url);
+				url = new URL(downloadUrl);
 			} catch {
 				throw new Error("ChatGPT attachment has an invalid download URL");
 			}
@@ -611,9 +615,18 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			if (totalEncoded > MAX_ENCODED_ATTACHMENT_BYTES) {
 				throw new Error("combined ChatGPT attachments exceed the Gmail message attachment limit");
 			}
-			const filename = file.file_name ?? file.file_id;
+			const rawName = url.pathname.split("/").filter(Boolean).at(-1) ?? "attachment";
+			let filename = typeof file === "string" ? rawName : (file.file_name ?? file.file_id);
+			try {
+				filename = decodeURIComponent(filename);
+			} catch {
+				// Keep the undecoded path segment when it is not valid percent encoding.
+			}
+			if (!filename || filename === "download") filename = "attachment";
 			const contentType =
-				file.mime_type ?? response.headers.get("content-type")?.split(";")[0] ?? "application/octet-stream";
+				(typeof file === "string" ? undefined : file.mime_type) ??
+				response.headers.get("content-type")?.split(";")[0] ??
+				"application/octet-stream";
 			if (/[\r\n\0]/.test(filename)) {
 				throw new Error("attachment filename contains a line break or NUL");
 			}
