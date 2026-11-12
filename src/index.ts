@@ -623,7 +623,8 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 		}
 		return resolved;
 	}
-ds Record<string, z.ZodType>>(
+
+	private registerTool<Args extends Record<string, z.ZodType>>(
 		name: string,
 		description: string,
 		inputSchema: Args,
