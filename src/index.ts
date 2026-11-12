@@ -151,8 +151,13 @@ const filePartSchema = z.object({
 });
 type FilePartArg = z.infer<typeof filePartSchema>;
 
-// ChatGPT's fileParams contract supplies each uploaded file as its signed URL.
-const chatGptFileSchema = z.string().url();
+// ChatGPT fileParams injects uploaded files as objects containing their signed URL and metadata.
+const chatGptFileSchema = z.object({
+	download_url: z.string().url(),
+	file_id: z.string(),
+	mime_type: z.string().optional(),
+	file_name: z.string().optional(),
+});
 type ChatGptFileRef = z.infer<typeof chatGptFileSchema>;
 
 
@@ -573,10 +578,10 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 	private async resolveChatGptFiles(files: ChatGptFileRef[] | undefined): Promise<FilePart[]> {
 		const resolved: FilePart[] = [];
 		let totalEncoded = 0;
-		for (const downloadUrl of files ?? []) {
+		for (const file of files ?? []) {
 			let url: URL;
 			try {
-				url = new URL(downloadUrl);
+				url = new URL(file.download_url);
 			} catch {
 				throw new Error("ChatGPT attachment has an invalid download URL");
 			}
@@ -606,16 +611,12 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			if (totalEncoded > MAX_ENCODED_ATTACHMENT_BYTES) {
 				throw new Error("combined ChatGPT attachments exceed the Gmail message attachment limit");
 			}
-			const rawName = url.pathname.split("/").filter(Boolean).at(-1) ?? "attachment";
-			let filename: string;
-			try {
-				filename = decodeURIComponent(rawName);
-			} catch {
-				filename = rawName;
+			const filename = file.file_name ?? file.file_id;
+			const contentType =
+				file.mime_type ?? response.headers.get("content-type")?.split(";")[0] ?? "application/octet-stream";
+			if (/[\r\n\0]/.test(filename)) {
+				throw new Error("attachment filename contains a line break or NUL");
 			}
-			if (!filename || filename === "download") filename = "attachment";
-			const contentType = response.headers.get("content-type")?.split(";")[0] ?? "application/octet-stream";
-			if (/[\\r\\n\\0]/.test(filename)) throw new Error("attachment filename contains a line break or NUL");
 			if (!/^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+$/.test(contentType)) {
 				throw new Error(`invalid attachment content type: ${contentType}`);
 			}
