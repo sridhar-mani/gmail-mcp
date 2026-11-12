@@ -8,6 +8,10 @@
 		{
 			"new_sqlite_classes": ["GmailMCP"],
 			"tag": "v1"
+		},
+		{
+			"new_sqlite_classes": ["AttachmentStore"],
+			"tag": "v2"
 		}
 	],
 	"durable_objects": {
@@ -15,6 +19,10 @@
 			{
 				"class_name": "GmailMCP",
 				"name": "MCP_OBJECT"
+			},
+			{
+				"class_name": "AttachmentStore",
+				"name": "ATTACHMENT_STORE"
 			}
 		]
 	},
