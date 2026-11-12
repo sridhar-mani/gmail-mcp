@@ -1,4 +1,5 @@
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
+import type { StagedAttachment } from "./attachments";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getAgentByName } from "agents";
 import { McpAgent } from "agents/mcp";
@@ -106,33 +107,8 @@ const MCP_MESSAGE_LIMIT = 4 * 1024 * 1024;
 // Staged attachments: file bytes held in the session's own storage so that a
 // message can carry a file whose base64 would never fit through tool
 // arguments. How long an unused staging lives before it is swept.
-const STAGED_TTL_MS = 24 * 60 * 60 * 1000;
-// A stored slice of staged base64. Durable Object values carry up to 2 MB;
-// staying at half leaves the metadata beside it out of the reckoning.
-const STAGED_CHUNK_CHARS = 1_000_000;
-// One appended chunk is stored as one value, so it shares that ceiling.
 const MAX_APPEND_CHARS = 1_000_000;
-// Raw upload ceiling: these bytes encode to MAX_ENCODED_ATTACHMENT_BYTES of
-// base64, which is where the message builder draws its own line.
 const MAX_RAW_UPLOAD_BYTES = 10_000_000;
-// Everything staged at once, across files. A session stages a file, attaches
-// it, and moves on; holding several messages' worth is not what this is for.
-const MAX_STAGED_TOTAL_CHARS = 32_000_000;
-
-// What a staging holds beside its chunks. The secret gates the upload URL:
-// whoever holds it may fill this one staging, and nothing else.
-type StagedMeta = {
-	filename: string;
-	contentType: string;
-	secret: string;
-	at: number;
-	sealed: boolean;
-	chunks: number;
-	encodedLength: number;
-	// Base64 "=" count seen so far. Padding closes the stream, so anything
-	// after it cannot be part of the same file.
-	padding: number;
-};
 
 const filePartSchema = z.object({
 	filename: z.string().optional().describe("Required with content; a staged file brings its own"),
@@ -199,9 +175,6 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 		// A staged upload authenticates by its address alone: the boundary sends
 		// it here without a grant, and the secret in the path is what
 		// stage_attachment_begin handed the session that asked for it.
-		if (url.pathname.startsWith("/upload/")) {
-			return this.acceptUpload(request, url);
-		}
 		const account = request.headers.get(ACCOUNT_HEADER)?.toLowerCase();
 		if (account) {
 			const owner = await this.ctx.storage.get<string>("owner");
@@ -454,124 +427,20 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 		return decodeAttachmentText(att.data, ref.mimeType, ref.charset);
 	}
 
-	// ---- Staged attachments -------------------------------------------------
-
-	// The upload URL half of staging: raw bytes arrive in one PUT, are encoded
-	// here, and seal the staging themselves. Failures answer with the same 404
-	// whether the id or the secret was wrong: the address either works or it
-	// does not.
-	private async acceptUpload(request: Request, url: URL): Promise<Response> {
-		if (request.method !== "PUT") {
-			return new Response("PUT the raw file bytes to this URL", { status: 405 });
-		}
-		const [, , , stagingId, secret] = url.pathname.split("/").map(decodeURIComponent);
-		const meta = stagingId
-			? await this.ctx.storage.get<StagedMeta>(`staged:${stagingId}`)
-			: undefined;
-		// The secret is an unguessable 122-bit UUID compared against storage this
-		// object alone reads, so equality is the whole check.
-		if (!meta || meta.secret !== secret || Date.now() - meta.at > STAGED_TTL_MS) {
-			return new Response("no staging answers to this address", { status: 404 });
-		}
-		if (meta.sealed || meta.chunks > 0) {
-			return new Response("this staging already holds data", { status: 409 });
-		}
-		let bytes: Uint8Array;
-		try {
-			bytes = await readBoundedBody(request, MAX_RAW_UPLOAD_BYTES);
-		} catch (error: unknown) {
-			if (error instanceof BodyTooLarge) {
-				return new Response(`the upload exceeds ${MAX_RAW_UPLOAD_BYTES} bytes`, { status: 413 });
-			}
-			throw error;
-		}
-		const encoded = bytesToB64(bytes);
-		const chunks = Math.ceil(encoded.length / STAGED_CHUNK_CHARS);
-		for (let i = 0; i < chunks; i++) {
-			await this.ctx.storage.put(
-				`staged:${stagingId}:chunk:${i}`,
-				encoded.slice(i * STAGED_CHUNK_CHARS, (i + 1) * STAGED_CHUNK_CHARS),
-			);
-		}
-		await this.ctx.storage.put(`staged:${stagingId}`, {
-			...meta,
-			sealed: true,
-			chunks,
-			encodedLength: encoded.length,
-			padding: encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0,
-		} satisfies StagedMeta);
-		return Response.json({
-			stagingId,
-			filename: meta.filename,
-			contentType: meta.contentType,
-			size: bytes.length,
-		});
+	private attachmentStore() {
+		const account = (this.callerAccount ?? this.grantProps.email).toLowerCase();
+		return this.env.ATTACHMENT_STORE.getByName(account);
 	}
 
-	// Sweeps stagings past their lifetime and reports how much the live ones
-	// hold, which is what bounds the store as a whole.
-	private async sweepStaged(): Promise<number> {
-		const entries = await this.ctx.storage.list<StagedMeta>({ prefix: "staged:" });
-		const dead: string[] = [];
-		let liveChars = 0;
-		for (const [key, meta] of entries) {
-			if (key.includes(":chunk:")) continue;
-			if (Date.now() - meta.at > STAGED_TTL_MS) {
-				dead.push(key);
-				for (let i = 0; i < meta.chunks; i++) dead.push(`${key}:chunk:${i}`);
-			} else {
-				liveChars += meta.encodedLength;
-			}
-		}
-		// A delete takes at most 128 keys at a time.
-		for (let i = 0; i < dead.length; i += 128) {
-			await this.ctx.storage.delete(dead.slice(i, i + 128));
-		}
-		return liveChars;
-	}
-
-	private async stagedMeta(stagingId: string): Promise<StagedMeta> {
-		const meta = await this.ctx.storage.get<StagedMeta>(`staged:${stagingId}`);
-		if (!meta || Date.now() - meta.at > STAGED_TTL_MS) {
-			throw new Error(
-				`no staged attachment ${stagingId}; stage_attachment_begin starts one, and a staging lasts ${STAGED_TTL_MS / 3_600_000} hours`,
-			);
-		}
-		return meta;
-	}
-
-	private async stagedContent(
-		stagingId: string,
-	): Promise<{ filename: string; contentType: string; content: string }> {
-		const meta = await this.stagedMeta(stagingId);
-		if (!meta.sealed) {
-			throw new Error(
-				`staged attachment ${stagingId} is not finished; stage_attachment_finish seals appended chunks, an upload seals itself`,
-			);
-		}
-		const parts: string[] = [];
-		for (let i = 0; i < meta.chunks; i++) {
-			const chunk = await this.ctx.storage.get<string>(`staged:${stagingId}:chunk:${i}`);
-			if (chunk === undefined) {
-				throw new Error(`staged attachment ${stagingId} lost a chunk; stage the file again`);
-			}
-			parts.push(chunk);
-		}
-		return { filename: meta.filename, contentType: meta.contentType, content: parts.join("") };
-	}
-
-	// One part may bring its bytes inline or point at a staging, never both.
 	private async resolveStaged(
 		part: { content?: string | undefined; stagingId?: string | undefined },
 		what: string,
-	): Promise<{ filename: string; contentType: string; content: string } | null> {
+	): Promise<StagedAttachment | null> {
 		if (part.stagingId !== undefined && part.content !== undefined) {
 			throw new Error(`${what} carries either content or stagingId, never both`);
 		}
-		if (part.stagingId !== undefined) return this.stagedContent(part.stagingId);
-		if (part.content === undefined) {
-			throw new Error(`${what} needs content or stagingId`);
-		}
+		if (part.stagingId !== undefined) return this.attachmentStore().getContent(part.stagingId);
+		if (part.content === undefined) throw new Error(`${what} needs content or stagingId`);
 		return null;
 	}
 
@@ -1317,118 +1186,41 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 
 		this.server.tool(
 			"stage_attachment_begin",
-			`Stage a file for ${account} outside tool arguments, for attachments whose base64 is too large to pass inline. Then either PUT the raw file bytes to the returned uploadUrl (curl -T <file> '<uploadUrl>'), which finishes the staging by itself, or send base64 with stage_attachment_append and seal it with stage_attachment_finish. Any attachments or inlineImages field then accepts {"stagingId": ...}`,
-			{
-				filename: z.string(),
-				contentType: z.string().describe("Media type, e.g. application/pdf"),
-			},
+			`Stage a file for ${account}. Staging is stored independently of this MCP session.`,
+			{ filename: z.string(), contentType: z.string().describe("Media type, e.g. application/pdf") },
 			async ({ filename, contentType }) => {
 				await this.assertSessionOwner();
 				await this.assertWithinRate();
-				// Refused here, before any bytes move: the builder would refuse the
-				// finished attachment anyway, and later is after the upload.
-				if (/[\r\n\0]/.test(filename)) {
-					throw new Error("filename contains a line break or NUL");
-				}
-				if (!/^[\w.+-]+\/[\w.+-]+$/.test(contentType)) {
-					throw new Error(`invalid content type: ${contentType}`);
-				}
-				const held = await this.sweepStaged();
-				if (held > MAX_STAGED_TOTAL_CHARS) {
-					throw new Error(
-						"the staging store is full; attach what is already staged or wait for it to expire",
-					);
-				}
-				const stagingId = crypto.randomUUID();
-				const meta: StagedMeta = {
-					filename,
-					contentType,
-					secret: crypto.randomUUID(),
-					at: Date.now(),
-					sealed: false,
-					chunks: 0,
-					encodedLength: 0,
-					padding: 0,
-				};
-				await this.ctx.storage.put(`staged:${stagingId}`, meta);
-				const name = this.ctx.id.name;
-				const uploadUrl =
-					this.origin && name
-						? `${this.origin}/upload/${encodeURIComponent(name)}/${stagingId}/${meta.secret}`
-						: undefined;
-				return this.text({
-					stagingId,
-					uploadUrl,
-					expiresAt: new Date(meta.at + STAGED_TTL_MS).toISOString(),
-					next: uploadUrl
-						? "PUT the raw file bytes to uploadUrl, or append base64 with stage_attachment_append and call stage_attachment_finish"
-						: "append base64 with stage_attachment_append, then call stage_attachment_finish",
-				});
+				if (/[\\r\\n\\0]/.test(filename)) throw new Error("filename contains a line break or NUL");
+				if (!/^[\\w.+-]+\\/[\\w.+-]+$/.test(contentType)) throw new Error(`invalid content type: ${contentType}`);
+				const created = await this.attachmentStore().begin(filename, contentType);
+				const uploadUrl = this.origin
+					? `${this.origin}/upload/${encodeURIComponent(account.toLowerCase())}/${created.stagingId}/${created.secret}`
+					: undefined;
+				return this.text({ stagingId: created.stagingId, uploadUrl, expiresAt: created.expiresAt,
+					next: uploadUrl ? "PUT raw file bytes to uploadUrl, or append base64 and finish" : "append base64, then finish" });
 			},
 		);
 
 		this.server.tool(
 			"stage_attachment_append",
-			`Add base64 to a staged attachment in ${account}, in order, up to ${MAX_APPEND_CHARS} characters per call`,
-			{
-				stagingId: z.string(),
-				content: z
-					.string()
-					.describe("Standard base64; every chunk before the last must carry no padding"),
-			},
+			`Append base64 to a staged attachment for ${account}; each chunk may contain up to ${MAX_APPEND_CHARS} characters.`,
+			{ stagingId: z.string(), content: z.string().describe("Standard base64; every chunk before the last must carry no padding") },
 			async ({ stagingId, content }) => {
 				await this.assertSessionOwner();
 				await this.assertWithinRate();
-				const meta = await this.stagedMeta(stagingId);
-				if (meta.sealed) {
-					throw new Error("this staging is already finished; begin a new one to replace it");
-				}
-				if (meta.padding > 0) {
-					throw new Error("an earlier chunk ended with padding, which closes the file");
-				}
-				const cleaned = content.replace(/\s+/g, "");
-				if (!/^[A-Za-z0-9+/]+={0,2}$/.test(cleaned) || cleaned.length % 4 !== 0) {
-					throw new Error("content must be standard base64 in whole four-character groups");
-				}
-				if (cleaned.length > MAX_APPEND_CHARS) {
-					throw new Error(`append at most ${MAX_APPEND_CHARS} characters per call`);
-				}
-				if (meta.encodedLength + cleaned.length > MAX_ENCODED_ATTACHMENT_BYTES) {
-					throw new Error(
-						`this file would exceed the ${MAX_ENCODED_ATTACHMENT_BYTES}-character ceiling a message can carry`,
-					);
-				}
-				await this.ctx.storage.put(`staged:${stagingId}:chunk:${meta.chunks}`, cleaned);
-				const next: StagedMeta = {
-					...meta,
-					chunks: meta.chunks + 1,
-					encodedLength: meta.encodedLength + cleaned.length,
-					padding: (cleaned.match(/=/g) ?? []).length,
-				};
-				await this.ctx.storage.put(`staged:${stagingId}`, next);
-				return this.text({ stagingId, encodedLength: next.encodedLength });
+				return this.text(await this.attachmentStore().append(stagingId, content));
 			},
 		);
 
 		this.server.tool(
 			"stage_attachment_finish",
-			`Seal a staged attachment in ${account} so messages and drafts can attach it by stagingId`,
+			`Seal a staged attachment for ${account} so messages and drafts can attach it by stagingId.`,
 			{ stagingId: z.string() },
 			async ({ stagingId }) => {
 				await this.assertSessionOwner();
 				await this.assertWithinRate();
-				const meta = await this.stagedMeta(stagingId);
-				const sealed = meta.sealed ? meta : { ...meta, sealed: true };
-				if (!meta.sealed) {
-					await this.ctx.storage.put(`staged:${stagingId}`, sealed);
-				}
-				return this.text({
-					stagingId,
-					filename: sealed.filename,
-					contentType: sealed.contentType,
-					size: (sealed.encodedLength / 4) * 3 - sealed.padding,
-					expiresAt: new Date(sealed.at + STAGED_TTL_MS).toISOString(),
-				});
+				return this.text(await this.attachmentStore().finish(stagingId));
 			},
 		);
 
@@ -2632,28 +2424,22 @@ function bodyLimitFor(path: string): number | null {
 // gates it because the two share a shape: no credentials up front, and each
 // call wakes or writes something that costs the deployment.
 async function uploadRoute(request: Request, env: Env, path: string): Promise<Response> {
-	if (request.method !== "PUT") {
-		return new Response("PUT the raw file bytes to an upload URL", { status: 405 });
-	}
+	if (request.method !== "PUT") return new Response("PUT the raw file bytes to an upload URL", { status: 405 });
 	const segments = path.split("/");
-	const name = decodeURIComponent(segments[2] ?? "");
-	if (segments.length !== 5 || !name) {
-		return new Response("no staging answers to this address", { status: 404 });
-	}
+	const account = decodeURIComponent(segments[2] ?? "").toLowerCase();
+	const stagingId = segments[3] ?? "";
+	const secret = segments[4] ?? "";
+	if (segments.length !== 5 || !account || !stagingId || !secret) return new Response("no staging answers to this address", { status: 404 });
 	if (env.REGISTER_LIMITER) {
 		const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
 		const { success } = await env.REGISTER_LIMITER.limit({ key: caller });
-		if (!success) {
-			return new Response("Too many uploads", { status: 429 });
-		}
+		if (!success) return new Response("Too many uploads", { status: 429 });
 	}
-	// A name that never belonged to a session wakes an object with no grant,
-	// which refuses to start at all; from out here that is the same wrong
-	// address as a bad secret, and it gets the same answer.
 	try {
-		const session = await getAgentByName<Env, GmailMCP>(env.MCP_OBJECT, name);
-		return await session.fetch(request);
-	} catch {
+		const bytes = await readBoundedBody(request, MAX_RAW_UPLOAD_BYTES);
+		return Response.json(await env.ATTACHMENT_STORE.getByName(account).acceptUpload(stagingId, secret, bytes));
+	} catch (error) {
+		if (error instanceof BodyTooLarge) return new Response(`the upload exceeds ${MAX_RAW_UPLOAD_BYTES} bytes`, { status: 413 });
 		return new Response("no staging answers to this address", { status: 404 });
 	}
 }
