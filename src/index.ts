@@ -622,11 +622,11 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 		return resolved;
 	}
 
-	private registerFileInputTool(
+	private registerFileInputTool<Args extends Record<string, z.ZodType>>(
 		name: string,
 		description: string,
-		inputSchema: Record<string, z.ZodType>,
-		handler: (args: Record<string, unknown>) => Promise<unknown>,
+		inputSchema: Args,
+		handler: (args: z.infer<z.ZodObject<Args>>) => Promise<ReturnType<typeof this.text>>,
 	): void {
 		this.server.registerTool(
 			name,
