@@ -589,7 +589,8 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 				url.protocol !== "https:" ||
 				url.username ||
 				url.password ||
-				(url.hostname !== "files.oaiusercontent.com" && !url.hostname.endsWith(".files.oaiusercontent.com"))
+				(url.hostname !== "files.oaiusercontent.com" &&
+					!url.hostname.endsWith(".files.oaiusercontent.com"))
 			) {
 				throw new Error("ChatGPT attachment URL must use the trusted files.oaiusercontent.com HTTPS host");
 			}
@@ -613,7 +614,9 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			const filename = file.file_name ?? file.file_id;
 			const contentType =
 				file.mime_type ?? response.headers.get("content-type")?.split(";")[0] ?? "application/octet-stream";
-			if (/[\r\n\0]/.test(filename)) throw new Error("attachment filename contains a line break or NUL");
+			if (/[\r\n\0]/.test(filename)) {
+				throw new Error("attachment filename contains a line break or NUL");
+			}
 			if (!/^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+$/.test(contentType)) {
 				throw new Error(`invalid attachment content type: ${contentType}`);
 			}
