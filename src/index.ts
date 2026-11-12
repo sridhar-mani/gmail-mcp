@@ -570,7 +570,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 		return null;
 	}
 
-	private async resolveChatGptFiles(files: 	private async resolveChatGptFiles(files: ChatGptFileRef[] | undefined): Promise<FilePart[]> {
+	private async resolveChatGptFiles(files: ChatGptFileRef[] | undefined): Promise<FilePart[]> {
 		const resolved: FilePart[] = [];
 		let totalEncoded = 0;
 		for (const downloadUrl of files ?? []) {
