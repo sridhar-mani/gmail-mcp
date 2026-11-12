@@ -114,7 +114,7 @@ const STAGED_CHUNK_CHARS = 1_000_000;
 const MAX_APPEND_CHARS = 1_000_000;
 // Raw upload ceiling: these bytes encode to MAX_ENCODED_ATTACHMENT_BYTES of
 // base64, which is where the message builder draws its own line.
-const MAX_RAW_UPLOAD_BYTES = 6_000_000;
+const MAX_RAW_UPLOAD_BYTES = 10_000_000;
 // Everything staged at once, across files. A session stages a file, attaches
 // it, and moves on; holding several messages' worth is not what this is for.
 const MAX_STAGED_TOTAL_CHARS = 32_000_000;

@@ -8,7 +8,7 @@ const BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 // Assembling a message copies it several times over — normalised, wrapped,
 // joined, encoded — so what may arrive is bounded well below both Gmail's own
 // 25 MB limit and the isolate's memory, rather than just under them.
-export const MAX_ENCODED_ATTACHMENT_BYTES = 8_000_000;
+export const MAX_ENCODED_ATTACHMENT_BYTES = 14_000_000;
 
 // What a run of bytes costs once base64 has been applied to it. Callers that
 // bound a fetch need the same figure the builder will compare against.
