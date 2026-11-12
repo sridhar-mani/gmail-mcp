@@ -36,7 +36,7 @@
 		"MAX_ACCOUNTS": "25",
 		// Only verified Google accounts listed here may connect.
 		// Add additional addresses as a comma-separated list (no spaces required).
-		"ALLOWED_EMAILS": "sridharstudy417@gmail.com",
+		"ALLOWED_EMAILS": "sridharstudy417@gmail.com,mailtosridhar01@gmail.com,sridharmani510@gmail.com,21f1000157@ds.study.iitm.ac.in",
 		// Mail filter tools. Adds the gmail.settings.basic scope to sign-in;
 		// forwarding actions stay excluded whatever this says.
 		"ENABLE_FILTERS": "true",
