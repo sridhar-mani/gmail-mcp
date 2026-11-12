@@ -151,6 +151,15 @@ const filePartSchema = z.object({
 });
 type FilePartArg = z.infer<typeof filePartSchema>;
 
+const chatGptFileSchema = z.object({
+	download_url: z.string().url(),
+	file_id: z.string(),
+	mime_type: z.string().optional(),
+	file_name: z.string().optional(),
+});
+type ChatGptFileRef = z.infer<typeof chatGptFileSchema>;
+
+
 const inlineImageSchema = z.object({
 	cid: z.string().describe('Content-ID referenced from the HTML as <img src="cid:...">'),
 	contentType: z
@@ -563,6 +572,71 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			throw new Error(`${what} needs content or stagingId`);
 		}
 		return null;
+	}
+
+	private async resolveChatGptFiles(files: ChatGptFileRef[] | undefined): Promise<FilePart[]> {
+		const resolved: FilePart[] = [];
+		let totalEncoded = 0;
+		for (const file of files ?? []) {
+			let url: URL;
+			try {
+				url = new URL(file.download_url);
+			} catch {
+				throw new Error("ChatGPT attachment has an invalid download URL");
+			}
+			if (
+				url.protocol !== "https:" ||
+				url.username ||
+				url.password ||
+				(url.hostname !== "files.oaiusercontent.com" &&
+					!url.hostname.endsWith(".files.oaiusercontent.com"))
+			) {
+				throw new Error("ChatGPT attachment URL must use the trusted files.oaiusercontent.com HTTPS host");
+			}
+			const response = await fetch(url, { redirect: "error" });
+			if (!response.ok) {
+				throw new Error(`could not download ChatGPT attachment (${response.status})`);
+			}
+			const declaredLength = Number(response.headers.get("content-length"));
+			if (Number.isFinite(declaredLength) && declaredLength > MAX_RAW_UPLOAD_BYTES) {
+				throw new Error(`ChatGPT attachment exceeds the ${MAX_RAW_UPLOAD_BYTES}-byte limit`);
+			}
+			const bytes = new Uint8Array(await response.arrayBuffer());
+			if (bytes.byteLength > MAX_RAW_UPLOAD_BYTES) {
+				throw new Error(`ChatGPT attachment exceeds the ${MAX_RAW_UPLOAD_BYTES}-byte limit`);
+			}
+			const content = bytesToB64(bytes);
+			totalEncoded += content.length;
+			if (totalEncoded > MAX_ENCODED_ATTACHMENT_BYTES) {
+				throw new Error("combined ChatGPT attachments exceed the Gmail message attachment limit");
+			}
+			const filename = file.file_name ?? file.file_id;
+			const contentType =
+				file.mime_type ?? response.headers.get("content-type")?.split(";")[0] ?? "application/octet-stream";
+			if (/[\r\n\0]/.test(filename)) throw new Error("attachment filename contains a line break or NUL");
+			if (!/^[\w.+-]+\/[\w.+-]+$/.test(contentType)) {
+				throw new Error(`invalid attachment content type: ${contentType}`);
+			}
+			resolved.push({ filename, contentType, content });
+		}
+		return resolved;
+	}
+
+	private registerFileInputTool(
+		name: string,
+		description: string,
+		inputSchema: Record<string, z.ZodType>,
+		handler: (args: Record<string, unknown>) => Promise<unknown>,
+	): void {
+		this.server.registerTool(
+			name,
+			{
+				description,
+				inputSchema,
+				_meta: { "openai/fileParams": ["files"] },
+			},
+			handler,
+		);
 	}
 
 	private async resolveAttachments(parts: FilePartArg[] | undefined): Promise<FilePart[]> {
@@ -1026,11 +1100,12 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			inlineImages: z.array(inlineImageSchema).default([]),
 		};
 
-		this.server.tool(
+		this.registerFileInputTool(
 			"create_draft",
 			`Create a draft in ${account} without sending. With replyToMessageId the draft joins that message's thread, carries its threading headers, and derives recipients and subject from a reply-all when they are not given`,
 			{
 				...draftFields,
+				files: z.array(chatGptFileSchema).optional().describe("Files attached to this ChatGPT conversation"),
 				to: z.string().optional().describe("Required unless replyToMessageId derives it"),
 				subject: z.string().optional().describe("Required unless replyToMessageId derives it"),
 				replyToMessageId: z
@@ -1042,9 +1117,11 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 					.default(true)
 					.describe("When replying, quote the original under the body"),
 			},
-			async ({ replyToMessageId, quote, to, subject, body, ...rest }) => {
+			async ({ replyToMessageId, quote, to, subject, body, files: chatGptFiles, ...rest }) => {
+				const uploadedFiles = await this.resolveChatGptFiles(chatGptFiles);
+				const attachments = [...(rest.attachments ?? []), ...uploadedFiles];
 				if (replyToMessageId) {
-					return this.createReplyDraft({ replyToMessageId, quote, to, subject, body, ...rest });
+					return this.createReplyDraft({ replyToMessageId, quote, to, subject, body, ...rest, attachments });
 				}
 				if (to === undefined || subject === undefined) {
 					throw new Error(
@@ -1057,7 +1134,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 						subject,
 						body,
 						...rest,
-						attachments: await this.resolveAttachments(rest.attachments),
+						attachments: await this.resolveAttachments(attachments),
 						inlineImages: await this.resolveInlineImages(rest.inlineImages),
 					}),
 				);
@@ -1069,7 +1146,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			},
 		);
 
-		this.server.tool(
+		this.registerFileInputTool(
 			"update_draft",
 			`Change parts of a draft in ${account}. Whatever is not passed keeps its current value — recipients, subject, text, files added in any client, and the thread the draft answers all survive the rebuild`,
 			{
@@ -1087,6 +1164,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 				cc: z.string().optional(),
 				bcc: z.string().optional(),
 				from: z.string().optional().describe("Send-as alias already configured in the account"),
+				files: z.array(chatGptFileSchema).optional().describe("Files attached to this ChatGPT conversation"),
 				attachments: z
 					.array(filePartSchema)
 					.optional()
@@ -1105,6 +1183,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 				cc,
 				bcc,
 				from,
+				files: chatGptFiles,
 				attachments,
 				inlineImages,
 			}) => {
@@ -1133,7 +1212,10 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 								htmlBody: extractHtmlBody(m.payload) || undefined,
 							};
 
-				const files = await this.keptFiles(m, attachments);
+				const files = [
+					...(await this.keptFiles(m, attachments)),
+					...(await this.resolveChatGptFiles(chatGptFiles)),
+				];
 				const images = await this.keptImages(m, inlineImages, text.htmlBody);
 
 				// The rebuilt message replaces the old one wholesale, so the threading
@@ -1345,11 +1427,12 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			},
 		);
 
-		this.server.tool(
+		this.registerFileInputTool(
 			"send_message",
 			`Send mail as ${account}. For replies pass threadId plus the original's Message-ID header, or its Gmail message id, as inReplyTo`,
 			{
 				...draftFields,
+				files: z.array(chatGptFileSchema).optional().describe("Files attached to this ChatGPT conversation"),
 				threadId: z.string().optional(),
 				inReplyTo: z
 					.string()
@@ -1368,6 +1451,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 				from,
 				attachments,
 				inlineImages,
+				files: chatGptFiles,
 				threadId,
 				inReplyTo,
 			}) => {
@@ -1389,7 +1473,10 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 						subject,
 						body,
 						htmlBody,
-						attachments: await this.resolveAttachments(attachments),
+						attachments: [
+							...(await this.resolveAttachments(attachments)),
+							...(await this.resolveChatGptFiles(chatGptFiles)),
+						],
 						inlineImages: await this.resolveInlineImages(inlineImages),
 						inReplyTo: threadHeader,
 						references: threadHeader,
@@ -1403,7 +1490,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			},
 		);
 
-		this.server.tool(
+		this.registerFileInputTool(
 			"reply_all",
 			`Reply to a message in ${account}, addressing every original recipient except this account, with the original quoted`,
 			{
@@ -1411,9 +1498,10 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 				body: z.string().describe("Plain-text reply, without quoted history"),
 				htmlBody: z.string().optional().describe("HTML reply, without quoted history"),
 				attachments: z.array(filePartSchema).default([]),
+				files: z.array(chatGptFileSchema).optional().describe("Files attached to this ChatGPT conversation"),
 				inlineImages: z.array(inlineImageSchema).default([]),
 			},
-			async ({ messageId, body, htmlBody, attachments, inlineImages }) => {
+			async ({ messageId, body, htmlBody, attachments, files: chatGptFiles, inlineImages }) => {
 				const reply = await this.replyContext(messageId);
 				if (reply.to.length === 0) {
 					throw new Error("reply_all found no recipient other than this account");
@@ -1426,7 +1514,10 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 						subject: reply.subject,
 						body: `${body}\n\n${reply.quotedPlain}`,
 						htmlBody: htmlBody ? `${htmlBody}\n<br>\n${reply.quotedHtml}` : undefined,
-						attachments: await this.resolveAttachments(attachments),
+						attachments: [
+							...(await this.resolveAttachments(attachments)),
+							...(await this.resolveChatGptFiles(chatGptFiles)),
+						],
 						inlineImages: await this.resolveInlineImages(inlineImages),
 						inReplyTo: reply.inReplyTo,
 						references: reply.references,

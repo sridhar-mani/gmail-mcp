@@ -69,10 +69,15 @@ function makeAgent({
 	vars = {} as Record<string, string>,
 } = {}) {
 	const handlers = new Map<string, Handler>();
+	const toolMetadata = new Map<string, Record<string, unknown>>();
 	const storage = new Map<string, unknown>();
 	const agent = Object.create(GmailMCP.prototype) as Record<string, unknown>;
 	agent.server = {
 		tool: (name: string, _d: string, _s: unknown, cb: Handler) => handlers.set(name, cb),
+		registerTool: (name: string, config: Record<string, unknown>, cb: Handler) => {
+			handlers.set(name, cb);
+			toolMetadata.set(name, config);
+		},
 	};
 	agent.props = {
 		email,
@@ -103,7 +108,7 @@ function makeAgent({
 		OAUTH_KV: kv,
 		...vars,
 	};
-	return { agent, handlers, storage, kv };
+	return { agent, handlers, storage, kv, toolMetadata };
 }
 
 async function boot(options: Parameters<typeof makeAgent>[0] = {}) {
@@ -137,6 +142,62 @@ beforeEach(() => {
 });
 afterEach(() => {
 	globalThis.fetch = realFetch;
+});
+
+describe("ChatGPT conversation attachments", () => {
+	test("send_message advertises fileParams and automatically attaches provided files", async () => {
+		const { handlers, toolMetadata } = await boot();
+		const config = toolMetadata.get("send_message");
+		expect((config?._meta as Record<string, unknown>)?.["openai/fileParams"]).toEqual(["files"]);
+		serve([
+			[
+				/files\.oaiusercontent\.com\/test-file/,
+				() => new Response(new Uint8Array([80, 68, 70]), {
+					status: 200,
+					headers: { "content-type": "application/pdf", "content-length": "3" },
+				}),
+			],
+			[/messages\/send$/, () => ({ id: "sent-file", threadId: "thread-file" })],
+		]);
+		const out = result(await tool(handlers, "send_message")({
+			to: "recipient@example.com",
+			subject: "Documents",
+			body: "Please find the documents attached.",
+			attachments: [],
+			inlineImages: [],
+			files: [{
+				download_url: "https://files.oaiusercontent.com/test-file",
+				file_id: "file-123",
+				mime_type: "application/pdf",
+				file_name: "document.pdf",
+			}],
+		}));
+		expect(out.id).toBe("sent-file");
+		const sent = requests.find((request) => request.url.includes("/messages/send"));
+		const raw = (sent?.body as { raw: string } | undefined)?.raw ?? "";
+		const decoded = atob(raw.replace(/-/g, "+").replace(/_/g, "/"));
+		expect(decoded).toContain("document.pdf");
+		expect(decoded).toContain("application/pdf");
+		expect(decoded).toContain("UERG");
+	});
+
+	test("refuses untrusted attachment download hosts before fetching", async () => {
+		const { handlers } = await boot();
+		serve([]);
+		await expect(tool(handlers, "send_message")({
+			to: "recipient@example.com",
+			subject: "Documents",
+			body: "Attached.",
+			attachments: [],
+			inlineImages: [],
+			files: [{
+				download_url: "https://attacker.example/file",
+				file_id: "file-123",
+				file_name: "document.pdf",
+			}],
+		})).rejects.toThrow("trusted files.oaiusercontent.com");
+		expect(requests).toHaveLength(0);
+	});
 });
 
 describe("read state", () => {
