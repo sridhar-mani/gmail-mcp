@@ -12,6 +12,7 @@ interface __BaseEnv_Env {
 	COOKIE_ENCRYPTION_KEY: string;
 	ALLOWED_EMAILS: string;
 	MCP_OBJECT: DurableObjectNamespace<import("./src/index").GmailMCP>;
+	ATTACHMENT_STORE: DurableObjectNamespace<import("./src/attachments").AttachmentStore>;
 	RATE_LIMITER: RateLimit;
 	REGISTER_LIMITER: RateLimit;
 }
