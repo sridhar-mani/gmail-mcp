@@ -624,7 +624,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 		return resolved;
 	}
 
-	private registerTool<Args extends Record<string, z.ZodType>>(
+	private registerFileInputTool<Args extends Record<string, z.ZodType>>(
 		name: string,
 		description: string,
 		inputSchema: Args,
